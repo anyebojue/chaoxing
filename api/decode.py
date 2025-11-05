@@ -84,7 +84,8 @@ def decode_course_point(_text):
                 ).attrs["value"]
             else:
                 # 判断是不是因为需要解锁
-                if "解锁" in _point.select_one("span.bntHoverTips").text:
+                _hover_tips = _point.select_one("span.bntHoverTips")
+                if _hover_tips and "解锁" in _hover_tips.text:
                     _course_point["hasLocked"] = True
 
             _point_list.append(_point_detail)

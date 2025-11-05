@@ -220,9 +220,9 @@ class Chaoxing:
         if _success:
             return resp.json()
         else:
-            # 若出现两个rt参数都返回403的情况, 则跳过当前任务
-            logger.warning("出现403报错, 尝试修复无效, 正在跳过当前任务点...")
-            return {"isPassed": False}  # 返回一个字典，确保调用代码不会出错
+            # 若出现两个rt参数都返回403的情况, 返回403标记
+            logger.warning("出现403报错, 尝试修复无效...")
+            return {"isPassed": False, "error": "403"}  # 添加403错误标记
 
     def study_video(
         self, _course, _job, _job_info, _speed: float = 1.0, _type: str = "Video"
@@ -242,6 +242,8 @@ class Chaoxing:
             _isPassed = False
             _isFinished = False
             _playingTime = 0
+            _403_retry_count = 0  # 403错误重试计数器
+            _max_403_retries = 3  # 最大重试次数
             logger.info(f"开始任务: {_job['name']}, 总时长: {_duration}秒")
             while not _isFinished:
                 if _isFinished:
@@ -256,13 +258,46 @@ class Chaoxing:
                     _playingTime,
                     _type,
                 )
+                # 检查是否是403错误
+                if _isPassed and _isPassed.get("error") == "403":
+                    _403_retry_count += 1
+                    if _403_retry_count >= _max_403_retries:
+                        # 达到最大重试次数，退出程序
+                        logger.error(f"=" * 60)
+                        logger.error(f"视频任务连续{_max_403_retries}次遇到403错误，程序退出")
+                        logger.error(f"课程名称: {_course.get('title', '未知')}")
+                        logger.error(f"视频名称: {_job['name']}")
+                        logger.error(f"视频进度: {int(_playingTime/int(_duration)*100)}% ({_playingTime}秒/{_duration}秒)")
+                        logger.error(f"建议: 等待1-2小时后重试，或手动完成此视频")
+                        logger.error(f"=" * 60)
+                        import sys
+                        sys.exit(1)
+
                 if not _isPassed or (_isPassed and _isPassed["isPassed"]):
                     break
                 _wait_time = get_random_seconds()
                 if _playingTime + _wait_time >= int(_duration):
                     _wait_time = int(_duration) - _playingTime
-                    _isPassed = self.video_progress_log(_session, _course, _job, _job_info, _dtoken, _duration, _duration, _type)
-                    if _isPassed['isPassed']:
+                    _iPassed = self.video_progress_log(_session, _course, _job, _job_info, _dtoken, _duration, _duration, _type)
+                    # 检查最终提交是否403
+                    if _iPassed and _iPassed.get("error") == "403":
+                        _403_retry_count += 1
+                        if _403_retry_count >= _max_403_retries:
+                            logger.error(f"=" * 60)
+                            logger.error(f"视频任务连续{_max_403_retries}次遇到403错误，程序退出")
+                            logger.error(f"课程名称: {_course.get('title', '未知')}")
+                            logger.error(f"视频名称: {_job['name']}")
+                            logger.error(f"视频进度: {int(_playingTime/int(_duration)*100)}% ({_playingTime}秒/{_duration}秒)")
+                            logger.error(f"建议: 等待1-2小时后重试，或手动完成此视频")
+                            logger.error(f"=" * 60)
+                            import sys
+                            sys.exit(1)
+
+                    if _iPassed and _iPassed.get('isPassed'):
+                        _isFinished = True
+                    # 如果在95%以上遇到403错误，视为已完成（平台通常95%以上就算完成）
+                    elif not _iPassed and _playingTime >= int(_duration * 0.95):
+                        logger.info(f"视频已播放至 {int(_playingTime/int(_duration)*100)}%，视为完成")
                         _isFinished = True
                 # 播放进度条
                 show_progress(_job["name"], _playingTime, _wait_time, _duration, _speed)

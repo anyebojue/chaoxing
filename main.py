@@ -133,6 +133,7 @@ if __name__ == "__main__":
         password = common_config.get("password","")
         course_list = common_config.get("course_list",None)
         speed = common_config.get("speed",1)
+        skip_work = common_config.get("skip_work", "false").lower() == "true"  # 读取是否跳过答题配置
         query_delay = tiku_config.get("delay",0)
         # 规范化播放速度的输入值
         speed = min(2.0, max(1.0, speed))
@@ -152,6 +153,11 @@ if __name__ == "__main__":
         _login_state = chaoxing.login()
         if not _login_state["status"]:
             raise LoginError(_login_state["msg"])
+
+        # 显示配置信息
+        if skip_work:
+            logger.info("已开启【只刷视频】模式，将跳过所有答题任务")
+
         # 获取所有的课程列表
         all_course = chaoxing.get_course_list()
         course_task = []
@@ -263,6 +269,9 @@ if __name__ == "__main__":
                         chaoxing.study_document(course, job)
                     # 测验任务
                     elif job["type"] == "workid":
+                        if skip_work:
+                            logger.info(f"【只刷视频模式】跳过章节检测任务: {course['title']}")
+                            continue
                         logger.trace(f"识别到章节检测任务, 任务章节: {course['title']}")
                         chaoxing.study_work(course, job, job_info)
                     # 阅读任务
