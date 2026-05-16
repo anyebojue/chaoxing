@@ -36,6 +36,15 @@ import os
 disable_warnings(exceptions.InsecureRequestWarning)
 
 
+def normalize_config_value(value):
+    if not isinstance(value, str):
+        return value
+    value = value.strip()
+    if len(value) >= 2 and value[0] == value[-1] and value[0] in {"'", '"'}:
+        return value[1:-1]
+    return value
+
+
 def init_config():
     parser = argparse.ArgumentParser(
         description="Samueli924/chaoxing",
@@ -79,6 +88,9 @@ def init_config():
         # 检查并读取common节
         if config.has_section("common"):
             common_config = dict(config.items("common"))
+            for key in ("username", "password"):
+                if key in common_config:
+                    common_config[key] = normalize_config_value(common_config[key])
             # 处理course_list，将字符串转换为列表
             if "course_list" in common_config and common_config["course_list"]:
                 common_config["course_list"] = common_config["course_list"].split(",")
