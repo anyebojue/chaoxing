@@ -1,11 +1,12 @@
 # -*- coding: utf-8 -*-
 import argparse
 import configparser
+import json
 import random
 
 from api.logger import logger
 from api.base import Chaoxing, Account
-from api.exceptions import LoginError, FormatError, JSONDecodeError, MaxRollBackError
+from api.exceptions import LoginError, FormatError, JSONDecodeError, MaxRollBackError, VideoProgress403Error
 from api.answer import Tiku
 from urllib3 import disable_warnings, exceptions
 import time
@@ -35,6 +36,11 @@ import os
 # 关闭警告
 disable_warnings(exceptions.InsecureRequestWarning)
 
+AUTO_RESTART_ENV = "CHAOXING_AUTO_RESTART_COUNT"
+MAX_AUTO_RESTARTS = 20
+AUTO_RESTART_DELAY = 5
+CHECKPOINT_PATH = "study_checkpoint.json"
+
 
 def normalize_config_value(value):
     if not isinstance(value, str):
@@ -43,6 +49,48 @@ def normalize_config_value(value):
     if len(value) >= 2 and value[0] == value[-1] and value[0] in {"'", '"'}:
         return value[1:-1]
     return value
+
+
+def restart_current_command():
+    restart_count = int(os.environ.get(AUTO_RESTART_ENV, "0")) + 1
+    if restart_count > MAX_AUTO_RESTARTS:
+        raise VideoProgress403Error(f"自动重启次数已达上限({MAX_AUTO_RESTARTS})")
+    os.environ[AUTO_RESTART_ENV] = str(restart_count)
+    logger.warning(
+        f"检测到视频403致命错误，{AUTO_RESTART_DELAY}秒后自动重启程序 "
+        f"(第{restart_count}/{MAX_AUTO_RESTARTS}次)"
+    )
+    time.sleep(AUTO_RESTART_DELAY)
+    os.execv(sys.executable, [sys.executable] + sys.argv)
+
+
+def save_checkpoint(course, point, job):
+    checkpoint = {
+        "courseId": course["courseId"],
+        "courseTitle": course["title"],
+        "pointId": point["id"],
+        "pointTitle": point["title"],
+        "jobid": job["jobid"],
+        "jobType": job["type"],
+        "jobName": job.get("name") or job.get("title") or job["jobid"],
+    }
+    with open(CHECKPOINT_PATH, "w", encoding="utf8") as fp:
+        json.dump(checkpoint, fp, ensure_ascii=False, indent=2)
+
+
+def load_checkpoint():
+    if not os.path.exists(CHECKPOINT_PATH):
+        return None
+    try:
+        with open(CHECKPOINT_PATH, "r", encoding="utf8") as fp:
+            return json.load(fp)
+    except (OSError, json.JSONDecodeError):
+        return None
+
+
+def clear_checkpoint():
+    if os.path.exists(CHECKPOINT_PATH):
+        os.remove(CHECKPOINT_PATH)
 
 
 def init_config():
@@ -193,7 +241,16 @@ if __name__ == "__main__":
             course_task = all_course
         # 开始遍历要学习的课程列表
         logger.info(f"课程列表过滤完毕, 当前课程任务数量: {len(course_task)}")
+        checkpoint = load_checkpoint()
+        resume_mode = checkpoint is not None
+        if checkpoint:
+            logger.warning(
+                f"检测到断点续跑: 课程[{checkpoint['courseTitle']}] "
+                f"章节[{checkpoint['pointTitle']}] 任务[{checkpoint['jobName']}]"
+            )
         for course in course_task:
+            if resume_mode and course["courseId"] != checkpoint["courseId"]:
+                continue
             logger.info(f"开始学习课程: {course['title']}")
             # 获取当前课程的所有章节
             point_list = chaoxing.get_course_point(
@@ -204,6 +261,9 @@ if __name__ == "__main__":
             __point_index = 0
             while __point_index < len(point_list["points"]):
                 point = point_list["points"][__point_index]
+                if resume_mode and point["id"] != checkpoint["pointId"]:
+                    __point_index += 1
+                    continue
                 logger.info(f'当前章节: {point["title"]}')
                 logger.debug(f"当前章节 __point_index: {__point_index}")  # 触发参数: -v
                 sleep_duration = random.uniform(1, 3)
@@ -239,10 +299,28 @@ if __name__ == "__main__":
                 chaoxing.rollback_times = RB.rollback_times
                 # 可能存在章节无任何内容的情况
                 if not jobs:
+                    if resume_mode:
+                        logger.info("断点任务已不在当前章节待完成列表中，继续后续任务")
+                        clear_checkpoint()
+                        checkpoint = None
+                        resume_mode = False
                     __point_index += 1
                     continue
+                if resume_mode:
+                    if not any(job["jobid"] == checkpoint["jobid"] for job in jobs):
+                        logger.info("断点任务已由服务器标记完成，从当前章节剩余任务继续")
+                        clear_checkpoint()
+                        checkpoint = None
+                        resume_mode = False
+                    else:
+                        logger.info(f"从断点任务继续: {checkpoint['jobName']}")
                 # 遍历所有任务点
                 for job in jobs:
+                    if resume_mode and job["jobid"] != checkpoint["jobid"]:
+                        continue
+                    if resume_mode and job["jobid"] == checkpoint["jobid"]:
+                        resume_mode = False
+                        checkpoint = None
                     # 视频任务
                     if job["type"] == "video":
                         # TODO: 目前这个记录功能还不够完善, 中途退出的课程ID也会被记录
@@ -255,6 +333,7 @@ if __name__ == "__main__":
                         logger.trace(
                             f"识别到视频任务, 任务章节: {course['title']} 任务ID: {job['jobid']}"
                         )
+                        save_checkpoint(course, point, job)
                         # 超星的接口没有返回当前任务是否为Audio音频任务
                         isAudio = False
                         try:
@@ -273,31 +352,41 @@ if __name__ == "__main__":
                                 logger.warning(
                                     f"出现异常任务 -> 任务章节: {course['title']} 任务ID: {job['jobid']}, 已跳过"
                                 )
+                        clear_checkpoint()
                     # 文档任务
                     elif job["type"] == "document":
                         logger.trace(
                             f"识别到文档任务, 任务章节: {course['title']} 任务ID: {job['jobid']}"
                         )
+                        save_checkpoint(course, point, job)
                         chaoxing.study_document(course, job)
+                        clear_checkpoint()
                     # 测验任务
                     elif job["type"] == "workid":
                         if skip_work:
                             logger.info(f"【只刷视频模式】跳过章节检测任务: {course['title']}")
                             continue
                         logger.trace(f"识别到章节检测任务, 任务章节: {course['title']}")
+                        save_checkpoint(course, point, job)
                         chaoxing.study_work(course, job, job_info)
+                        clear_checkpoint()
                     # 阅读任务
                     elif job["type"] == "read":
                         logger.trace(f"识别到阅读任务, 任务章节: {course['title']}")
+                        save_checkpoint(course, point, job)
                         chaoxing.strdy_read(course, job, job_info)
+                        clear_checkpoint()
                 __point_index += 1
         logger.info("所有课程学习任务已完成")
+        clear_checkpoint()
 
     except SystemExit as e:
         if e.code == 0:  # 正常退出
             sys.exit(0)
         else:
             raise
+    except VideoProgress403Error:
+        restart_current_command()
     except BaseException as e:
         import traceback
 

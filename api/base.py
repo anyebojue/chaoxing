@@ -19,6 +19,7 @@ from api.decode import (
     decode_questions_info,
 )
 from api.answer import *
+from api.exceptions import VideoProgress403Error
 
 
 def get_timestamp():
@@ -175,6 +176,20 @@ class Chaoxing:
             f"[{clazzId}][{userid}][{jobid}][{objectId}][{playingTime * 1000}][d_yHJ!$pdA~5][{duration * 1000}][0_{duration}]".encode()
         ).hexdigest()
 
+    def is_near_completion(self, playing_time, duration, threshold: float = 0.95):
+        if not duration:
+            return False
+        return playing_time >= int(duration * threshold)
+
+    def is_job_completed_on_server(self, course, job, job_info):
+        latest_jobs, _ = self.get_job_list(
+            course["clazzId"],
+            course["courseId"],
+            course["cpi"],
+            job_info["knowledgeid"],
+        )
+        return not any(_job["jobid"] == job["jobid"] for _job in latest_jobs)
+
     def video_progress_log(
         self,
         _session,
@@ -261,6 +276,12 @@ class Chaoxing:
                 # 检查是否是403错误
                 if _isPassed and _isPassed.get("error") == "403":
                     _403_retry_count += 1
+                    if self.is_near_completion(_playingTime, _duration):
+                        logger.warning("视频接近完成时遇到403，正在回查服务器任务状态")
+                        if self.is_job_completed_on_server(_course, _job, _job_info):
+                            logger.info("服务器已确认该视频任务完成")
+                            _isFinished = True
+                            break
                     if _403_retry_count >= _max_403_retries:
                         # 达到最大重试次数，退出程序
                         logger.error(f"=" * 60)
@@ -270,8 +291,11 @@ class Chaoxing:
                         logger.error(f"视频进度: {int(_playingTime/int(_duration)*100)}% ({_playingTime}秒/{_duration}秒)")
                         logger.error(f"建议: 等待1-2小时后重试，或手动完成此视频")
                         logger.error(f"=" * 60)
-                        import sys
-                        sys.exit(1)
+                        raise VideoProgress403Error(
+                            f"视频任务连续{_max_403_retries}次遇到403错误: {_job['name']}"
+                        )
+                elif _isPassed:
+                    _403_retry_count = 0
 
                 if not _isPassed or (_isPassed and _isPassed["isPassed"]):
                     break
@@ -282,6 +306,12 @@ class Chaoxing:
                     # 检查最终提交是否403
                     if _iPassed and _iPassed.get("error") == "403":
                         _403_retry_count += 1
+                        if self.is_near_completion(_playingTime, _duration):
+                            logger.warning("视频最终提交遇到403，正在回查服务器任务状态")
+                            if self.is_job_completed_on_server(_course, _job, _job_info):
+                                logger.info("服务器已确认该视频任务完成")
+                                _isFinished = True
+                                break
                         if _403_retry_count >= _max_403_retries:
                             logger.error(f"=" * 60)
                             logger.error(f"视频任务连续{_max_403_retries}次遇到403错误，程序退出")
@@ -290,14 +320,13 @@ class Chaoxing:
                             logger.error(f"视频进度: {int(_playingTime/int(_duration)*100)}% ({_playingTime}秒/{_duration}秒)")
                             logger.error(f"建议: 等待1-2小时后重试，或手动完成此视频")
                             logger.error(f"=" * 60)
-                            import sys
-                            sys.exit(1)
+                            raise VideoProgress403Error(
+                                f"视频任务连续{_max_403_retries}次遇到403错误: {_job['name']}"
+                            )
+                    elif _iPassed:
+                        _403_retry_count = 0
 
                     if _iPassed and _iPassed.get('isPassed'):
-                        _isFinished = True
-                    # 如果在95%以上遇到403错误，视为已完成（平台通常95%以上就算完成）
-                    elif not _iPassed and _playingTime >= int(_duration * 0.95):
-                        logger.info(f"视频已播放至 {int(_playingTime/int(_duration)*100)}%，视为完成")
                         _isFinished = True
                 # 播放进度条
                 show_progress(_job["name"], _playingTime, _wait_time, _duration, _speed)
