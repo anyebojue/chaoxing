@@ -181,15 +181,6 @@ class Chaoxing:
             return False
         return playing_time >= int(duration * threshold)
 
-    def is_job_completed_on_server(self, course, job, job_info):
-        latest_jobs, _ = self.get_job_list(
-            course["clazzId"],
-            course["courseId"],
-            course["cpi"],
-            job_info["knowledgeid"],
-        )
-        return not any(_job["jobid"] == job["jobid"] for _job in latest_jobs)
-
     def video_progress_log(
         self,
         _session,
@@ -277,11 +268,7 @@ class Chaoxing:
                 if _isPassed and _isPassed.get("error") == "403":
                     _403_retry_count += 1
                     if self.is_near_completion(_playingTime, _duration):
-                        logger.warning("视频接近完成时遇到403，正在回查服务器任务状态")
-                        if self.is_job_completed_on_server(_course, _job, _job_info):
-                            logger.info("服务器已确认该视频任务完成")
-                            _isFinished = True
-                            break
+                        logger.warning("视频接近完成时遇到403，保留断点并准备重试当前任务")
                     if _403_retry_count >= _max_403_retries:
                         # 达到最大重试次数，退出程序
                         logger.error(f"=" * 60)
@@ -307,11 +294,7 @@ class Chaoxing:
                     if _iPassed and _iPassed.get("error") == "403":
                         _403_retry_count += 1
                         if self.is_near_completion(_playingTime, _duration):
-                            logger.warning("视频最终提交遇到403，正在回查服务器任务状态")
-                            if self.is_job_completed_on_server(_course, _job, _job_info):
-                                logger.info("服务器已确认该视频任务完成")
-                                _isFinished = True
-                                break
+                            logger.warning("视频最终提交遇到403，保留断点并准备重试当前任务")
                         if _403_retry_count >= _max_403_retries:
                             logger.error(f"=" * 60)
                             logger.error(f"视频任务连续{_max_403_retries}次遇到403错误，程序退出")

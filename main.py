@@ -93,6 +93,12 @@ def clear_checkpoint():
         os.remove(CHECKPOINT_PATH)
 
 
+def cancel_resume_from_current_point(reason: str):
+    logger.warning(reason)
+    clear_checkpoint()
+    return None, False
+
+
 def init_config():
     parser = argparse.ArgumentParser(
         description="Samueli924/chaoxing",
@@ -300,18 +306,18 @@ if __name__ == "__main__":
                 # 可能存在章节无任何内容的情况
                 if not jobs:
                     if resume_mode:
-                        logger.info("断点任务已不在当前章节待完成列表中，继续后续任务")
-                        clear_checkpoint()
-                        checkpoint = None
-                        resume_mode = False
+                        checkpoint, resume_mode = cancel_resume_from_current_point(
+                            "断点任务恢复时当前章节任务列表为空，不判定为已完成，"
+                            "将取消断点并继续从后续章节重新检查"
+                        )
                     __point_index += 1
                     continue
                 if resume_mode:
                     if not any(job["jobid"] == checkpoint["jobid"] for job in jobs):
-                        logger.info("断点任务已由服务器标记完成，从当前章节剩余任务继续")
-                        clear_checkpoint()
-                        checkpoint = None
-                        resume_mode = False
+                        checkpoint, resume_mode = cancel_resume_from_current_point(
+                            "当前章节待完成任务列表中未找到断点任务，不直接判定完成，"
+                            "将取消断点并从当前章节剩余待完成任务继续"
+                        )
                     else:
                         logger.info(f"从断点任务继续: {checkpoint['jobName']}")
                 # 遍历所有任务点
