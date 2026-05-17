@@ -3,6 +3,7 @@ import argparse
 import configparser
 import json
 import random
+import re
 
 from api.logger import logger
 from api.base import Chaoxing, Account
@@ -99,6 +100,59 @@ def cancel_resume_from_current_point(reason: str):
     return None, False
 
 
+def parse_csv_list(value):
+    if not value:
+        return None
+    if isinstance(value, list):
+        return [item.strip() for item in value if item and item.strip()]
+    return [item.strip() for item in str(value).split(",") if item.strip()]
+
+
+def extract_title_outline_number(title):
+    title = str(title or "").strip()
+    match = re.match(r"^(\d+(?:\.\d+)*)", title)
+    if match:
+        return match.group(1)
+    return None
+
+
+def chapter_matches(point, chapter_filters, point_index=None):
+    if not chapter_filters:
+        return True
+    point_id = str(point.get("id", "")).strip()
+    point_title = str(point.get("title", "")).strip()
+    point_title_lower = point_title.lower()
+    outline_number = extract_title_outline_number(point_title)
+    for chapter_filter in chapter_filters:
+        chapter_filter = str(chapter_filter).strip()
+        if not chapter_filter:
+            continue
+        range_match = re.fullmatch(r"(\d+)\s*-\s*(\d+)", chapter_filter)
+        if range_match and point_index is not None:
+            start = int(range_match.group(1))
+            end = int(range_match.group(2))
+            if start > end:
+                start, end = end, start
+            if start <= point_index <= end:
+                return True
+            continue
+        if re.fullmatch(r"\d+(?:\.\d+)+", chapter_filter):
+            if outline_number == chapter_filter:
+                return True
+            continue
+        if chapter_filter.isdigit():
+            if point_index is not None and int(chapter_filter) == point_index:
+                return True
+            if outline_number == chapter_filter:
+                return True
+            continue
+        if point_id == chapter_filter:
+            return True
+        if chapter_filter.lower() in point_title_lower:
+            return True
+    return False
+
+
 def init_config():
     parser = argparse.ArgumentParser(
         description="Samueli924/chaoxing",
@@ -112,6 +166,13 @@ def init_config():
     parser.add_argument("-p", "--password", type=str, default=None, help="登录密码")
     parser.add_argument(
         "-l", "--list", type=str, default=None, help="要学习的课程ID列表, 以 , 分隔"
+    )
+    parser.add_argument(
+        "--chapter",
+        "--chapter-list",
+        type=str,
+        default=None,
+        help="要学习的章节序号/序号范围/章节ID/标题关键词, 以 , 分隔",
     )
     parser.add_argument(
         "-s", "--speed", type=float, default=1.0, help="视频播放倍速 (默认1, 最大2)"
@@ -147,7 +208,9 @@ def init_config():
                     common_config[key] = normalize_config_value(common_config[key])
             # 处理course_list，将字符串转换为列表
             if "course_list" in common_config and common_config["course_list"]:
-                common_config["course_list"] = common_config["course_list"].split(",")
+                common_config["course_list"] = parse_csv_list(common_config["course_list"])
+            if "chapter_list" in common_config and common_config["chapter_list"]:
+                common_config["chapter_list"] = parse_csv_list(common_config["chapter_list"])
             # 处理speed，将字符串转换为浮点数
             if "speed" in common_config:
                 common_config["speed"] = float(common_config["speed"])
@@ -164,7 +227,8 @@ def init_config():
         build_params = {'common':{},"tiku":{}}
         build_params['common']['username'] = args.username
         build_params['common']['password'] = args.password
-        build_params['common']['course_list'] = args.list.split(",") if args.list else None
+        build_params['common']['course_list'] = parse_csv_list(args.list)
+        build_params['common']['chapter_list'] = parse_csv_list(args.chapter)
         build_params['common']['speed'] = args.speed if args.speed else 1
         return build_params['common'],build_params['tiku']
 
@@ -198,6 +262,7 @@ if __name__ == "__main__":
         username = common_config.get("username","")
         password = common_config.get("password","")
         course_list = common_config.get("course_list",None)
+        chapter_list = common_config.get("chapter_list",None)
         speed = common_config.get("speed",1)
         skip_work = common_config.get("skip_work", "false").lower() == "true"  # 读取是否跳过答题配置
         query_delay = tiku_config.get("delay",0)
@@ -247,6 +312,8 @@ if __name__ == "__main__":
             course_task = all_course
         # 开始遍历要学习的课程列表
         logger.info(f"课程列表过滤完毕, 当前课程任务数量: {len(course_task)}")
+        if chapter_list:
+            logger.info(f"已启用章节筛选: {chapter_list}")
         checkpoint = load_checkpoint()
         resume_mode = checkpoint is not None
         if checkpoint:
@@ -267,10 +334,14 @@ if __name__ == "__main__":
             __point_index = 0
             while __point_index < len(point_list["points"]):
                 point = point_list["points"][__point_index]
+                chapter_number = __point_index + 1
                 if resume_mode and point["id"] != checkpoint["pointId"]:
                     __point_index += 1
                     continue
-                logger.info(f'当前章节: {point["title"]}')
+                if not resume_mode and not chapter_matches(point, chapter_list, chapter_number):
+                    __point_index += 1
+                    continue
+                logger.info(f'当前章节: 第{chapter_number}章 {point["title"]}')
                 logger.debug(f"当前章节 __point_index: {__point_index}")  # 触发参数: -v
                 sleep_duration = random.uniform(1, 3)
                 logger.debug(f"本次随机等待时间: {sleep_duration}")
