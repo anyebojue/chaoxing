@@ -169,10 +169,18 @@ class Tiku:
         false_list = self._conf['false_list'].split(',')
         # 对响应的答案作处理
         answer = answer.strip()
+        # 精确匹配
         if answer in true_list:
             return True
         elif answer in false_list:
             return False
+        # 在全文本中搜索关键词（处理完整解释的情况，如 "错误：xxx"）
+        for kw in true_list:
+            if kw in answer:
+                return True
+        for kw in false_list:
+            if kw in answer:
+                return False
         else:
             # 无法判断, 随机选择
             logger.error(f'无法判断答案 -> {answer} 对应的是正确还是错误, 请自行判断并加入配置文件重启脚本, 本次将会随机选择选项')
@@ -376,6 +384,276 @@ class TikuAdapter(Tiku):
     def _init_tiku(self):
         # self.load_token()
         self.api = self._conf['url']
+
+
+class TikuItihey(Tiku):
+    # itihey.com 题库实现
+    def __init__(self) -> None:
+        super().__init__()
+        self.name = 'itihey题库'
+        self.search_api = 'https://itihey.com/web-service/v1/search'
+        self.answer_api = 'https://itihey.com/web-service/v1/answer'
+        self._token = None
+
+    def _init_tiku(self):
+        # 从配置中读取 token
+        tokens = self._conf.get('tokens', '')
+        if not tokens:
+            logger.warning(f"{self.name} 未配置 tokens，答案功能将被禁用")
+            self.DISABLE = True
+        else:
+            # 支持多 token 逗号分隔，取第一个
+            self._token = tokens.split(',')[0].strip()
+            if not self._token:
+                self.DISABLE = True
+
+    def _query(self, q_info: dict):
+        if not self._token:
+            return None
+
+        session = requests.Session()
+        session.headers.update({
+            'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+            'Accept': 'application/json',
+        })
+        session.cookies.set('access-token', self._token, domain='itihey.com')
+
+        # 搜索题目
+        search_res = session.post(
+            self.search_api,
+            json={'question': q_info['title'], 'pageSize': 3, 'pageNo': 1},
+            verify=False, timeout=15
+        )
+        if search_res.status_code != 200:
+            logger.error(f"{self.name} 搜索失败 (HTTP {search_res.status_code}): {search_res.text[:200]}")
+            return None
+
+        try:
+            questions = search_res.json()
+            if not questions:
+                logger.error(f"{self.name} 未找到相关题目: {q_info['title'][:50]}")
+                return None
+        except Exception as e:
+            logger.error(f"{self.name} 解析搜索结果失败: {e}")
+            return None
+
+        # 精确匹配：找题目文本完全相同的
+        best_match = None
+        for q in questions:
+            if q.get('question') == q_info['title']:
+                best_match = q
+                break
+
+        # 没找到完全匹配的，取第一个（可能是模糊匹配）
+        if not best_match and questions:
+            best_match = questions[0]
+
+        if not best_match:
+            return None
+
+        # 获取答案
+        answer_res = session.get(
+            self.answer_api,
+            params={'id': best_match['id'], 'source': best_match.get('source', 'v1')},
+            verify=False, timeout=15
+        )
+
+        if answer_res.status_code == 200:
+            try:
+                answer_data = answer_res.json()
+                if isinstance(answer_data, list) and answer_data:
+                    answer_str = '\n'.join(str(a) for a in answer_data).strip()
+                    logger.info(f"{self.name} 查询成功: {q_info['title'][:30]} -> {answer_str}")
+                    return answer_str
+                elif isinstance(answer_data, str) and answer_data:
+                    return answer_data.strip()
+            except Exception:
+                pass
+            logger.error(f"{self.name} 解析答案失败: {answer_res.text[:200]}")
+        elif answer_res.status_code == 401:
+            logger.error(f"{self.name} Token无效或已过期，请重新扫码登录获取 access-token")
+        else:
+            logger.error(f"{self.name} 获取答案失败 (HTTP {answer_res.status_code}): {answer_res.text[:200]}")
+        return None
+
+
+class TikuDaxue(Tiku):
+    # 大学搜题王 (daxuesoutijiang.com) 题库实现
+    # 答案直接从 SSE 流中的 notification 事件获取，无需额外调用 getAnswer
+    def __init__(self) -> None:
+        super().__init__()
+        self.name = '大学搜题王'
+        self.search_api = 'https://www.daxuesoutijiang.com/dxkits/aisearch/web/askstream'
+        self._dxuss = None
+        self._session_id = None
+
+    def _init_tiku(self):
+        tokens = self._conf.get('tokens', '')
+        if not tokens:
+            logger.warning(f"{self.name} 未配置 tokens，答案功能将被禁用")
+            self.DISABLE = True
+        else:
+            parts = tokens.split(',')
+            self._dxuss = parts[0].strip()
+            self._session_id = parts[1].strip() if len(parts) > 1 else ''
+            if not self._dxuss:
+                self.DISABLE = True
+
+    def _query(self, q_info: dict):
+        if not self._dxuss:
+            return None
+
+        import time as time_module
+
+        session = requests.Session()
+        session.headers.update({
+            'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36',
+            'Accept': 'text/event-stream',
+            'Accept-Language': 'zh-CN,zh;q=0.9',
+            'Content-Type': 'application/x-www-form-urlencoded; charset=utf-8',
+            'Origin': 'https://www.daxuesoutijiang.com',
+            'Referer': 'https://www.daxuesoutijiang.com/ai-chat',
+            'Sec-Fetch-Mode': 'cors',
+            'Sec-Fetch-Site': 'same-origin',
+            'Sec-Fetch-Dest': 'empty',
+            'sec-ch-ua': '"Chromium";v="148", "Google Chrome";v="148", "Not/A)Brand";v="99"',
+            'sec-ch-ua-mobile': '?0',
+            'sec-ch-ua-platform': '"macOS"',
+            'Accept-Encoding': 'gzip, deflate, br, zstd',
+            'Priority': 'u=1, i',
+        })
+        session.cookies.set('DXUSS', self._dxuss, domain='.daxuesoutijiang.com')
+        session.cookies.set('Hm_lvt_bad2e71c01dba2e916b445b101d797ff', '1779071554', domain='.daxuesoutijiang.com')
+        session.cookies.set('HMACCOUNT', '77DD9280A32566F1', domain='.daxuesoutijiang.com')
+
+        question_text = q_info['title']
+        if q_info.get('options'):
+            opts = q_info['options']
+            if isinstance(opts, str):
+                opts = opts.split('\n')
+            question_text += '\n' + '\n'.join(opts)
+
+        local_msg_id = f"{int(time_module.time() * 1000)}-{random.randint(100, 999)}"
+        payload = (
+            f'source=aitab&userType=1&questionType=1&vc=1&appId=collegepcpi&scene=1'
+            f'&localMsgId={local_msg_id}&sessionId={self._session_id}&chatPageFrom=collegepcpi'
+            f'&ext=%7B%22editFlag%22%3A%220%22%2C%22questionId%22%3A%22%22%7D'
+            f'&questionData=%7B%22text%22%3A%22'
+            + question_text.replace('"', '\\"').replace('\n', '\\n')
+            + '%22%7D&messageCategory=400'
+        )
+
+        answer_chunks = []
+        current_event = None
+
+        try:
+            resp = session.post(
+                self.search_api,
+                data=payload.encode('utf-8'),
+                verify=False,
+                timeout=20,
+                stream=True
+            )
+
+            for line in resp.iter_lines():
+                if not line:
+                    continue
+                try:
+                    line_str = line.decode('utf-8', errors='ignore')
+                    if line_str.startswith('event:'):
+                        current_event = line_str[6:].strip()
+                        continue
+                    if line_str.startswith('data:'):
+                        raw = line_str[5:].strip()
+                        if not raw or raw == 'null':
+                            continue
+                        data = json.loads(raw)
+                        d = data.get('data', {})
+                        if current_event == 'recognition':
+                            answer_text = d.get('answerText', d.get('text', ''))
+                            if answer_text:
+                                answer_chunks.append(answer_text)
+                        elif current_event == 'notification':
+                            c = d.get('content', {})
+                            if isinstance(c, dict):
+                                text = c.get('text', '')
+                            else:
+                                text = str(c)
+                            # 处理转义
+                            text = text.replace('\\n', '\n').replace('\n', '\n')
+                            if text:
+                                answer_chunks.append(text)
+                        elif current_event == 'finish':
+                            break
+                except Exception:
+                    continue
+        except Exception as e:
+            logger.error(f"{self.name} 搜索失败: {e}")
+            return None
+
+        if not answer_chunks:
+            logger.error(f"{self.name} 未获取到答案")
+            return None
+
+        full_answer = ''.join(answer_chunks).strip()
+        if not full_answer:
+            return None
+
+        # 提取答案：从 "# 块" 中找 "答案" 行，然后提取选项字母
+        # 格式可能是 "B：1.5"、"B" 或 "B."
+        colon_chars = ':：'
+        # 先在答案块中找
+        answer_letter = None
+        in_answer_block = False
+        found_answer_keyword = False
+        for line in full_answer.split('\n'):
+            stripped = line.strip()
+            if stripped == '#':
+                in_answer_block = True
+                found_answer_keyword = False
+                continue
+            if in_answer_block and stripped in ('答案', '答案：', '答案:'):
+                found_answer_keyword = True
+                continue
+            if in_answer_block and found_answer_keyword:
+                if not stripped or stripped in ('解析', '解析：', '解析:'):
+                    break
+                # 格式 "C：绝对星等" 或 "C：1.5"
+                if len(stripped) >= 2 and stripped[0] in 'ABCDEFGHIJKLMNOPQRSTUVWXYZ' and stripped[1] in colon_chars:
+                    answer_letter = stripped[0]
+                    break
+                # 格式 "C" 或 "C."
+                if stripped.upper() in 'ABCDEFGHIJKLMNOPQRSTUVWXYZ' and len(stripped) <= 2:
+                    answer_letter = stripped.upper()
+                    break
+
+        if answer_letter:
+            logger.info(f"{self.name} 查询成功: {q_info['title'][:30]} -> {answer_letter}")
+            return answer_letter
+
+        # 如果答案块没找到，在整个回答中查找 "X：内容" 格式
+        for line in full_answer.split('\n'):
+            stripped = line.strip()
+            if len(stripped) >= 2 and stripped[0] in 'ABCDEFGHIJKLMNOPQRSTUVWXYZ' and stripped[1] in colon_chars:
+                # 确认这是答案行（后面跟内容，不是单纯的 "A：")
+                content = stripped[2:].strip()
+                if content:
+                    answer_letter = stripped[0]
+                    logger.info(f"{self.name} 查询成功: {q_info['title'][:30]} -> {answer_letter}")
+                    return answer_letter
+                # 可能是格式 "A：" 单独一行，需要看下一行
+                for next_line in full_answer.split('\n'):
+                    next_stripped = next_line.strip()
+                    if next_stripped and next_stripped not in ('#', '解析', '答案', '答案：', '答案:'):
+                        # 下一行有内容，把它当成答案内容
+                        answer_letter = stripped[0]
+                        logger.info(f"{self.name} 查询成功: {q_info['title'][:30]} -> {answer_letter}")
+                        return answer_letter
+
+        # 最后兜底：直接返回整个回答内容
+        logger.info(f"{self.name} 查询成功: {q_info['title'][:30]} -> {full_answer[:50]}")
+        return full_answer
+
 
 class AI(Tiku):
     # AI大模型答题实现

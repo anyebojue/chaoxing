@@ -22,3 +22,8 @@ class MaxRollBackError(Exception):
 class VideoProgress403Error(Exception):
     def __init__(self, *args: object):
         super().__init__(*args)
+
+
+class VerifyPageError(Exception):
+    def __init__(self, *args: object):
+        super().__init__(*args)
