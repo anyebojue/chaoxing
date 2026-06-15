@@ -151,3 +151,6 @@ config*.ini
 .idea/
 .vscode/
 cache.json
+
+# macOS 系统文件
+.DS_Store
