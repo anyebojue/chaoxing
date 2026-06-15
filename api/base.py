@@ -19,7 +19,7 @@ from api.decode import (
     decode_questions_info,
 )
 from api.answer import *
-from api.exceptions import VideoProgress403Error
+from api.exceptions import VerifyPageError, VideoProgress403Error
 
 
 def get_timestamp():
@@ -28,6 +28,16 @@ def get_timestamp():
 
 def get_random_seconds():
     return random.randint(30, 90)
+
+
+def is_verify_page(_text: str):
+    markers = (
+        "processVerify.ac",
+        "processVerifyPng.ac",
+        "操作异常，请输入图片中的验证码",
+        "输入验证码",
+    )
+    return any(marker in _text for marker in markers)
 
 
 def init_session(isVideo: bool = False, isAudio: bool = False):
@@ -146,24 +156,48 @@ class Chaoxing:
         logger.info("课程章节读取成功...")
         return decode_course_point(_resp.text)
 
-    def get_job_list(self, _clazzid, _courseid, _cpi, _knowledgeid):
+    def get_job_list(self, _clazzid, _courseid, _cpi, _knowledgeid, _job_count=3):
         _session = init_session()
         job_list = []
         job_info = {}
-        for _possible_num in [
-            "0",
-            "1",
-            "2",
-        ]:  # 学习界面任务卡片数, 很少有3个的, 但是对于章节解锁任务点少一个都不行, 可以从API /mooc-ans/mycourse/studentstudyAjax获取值, 或者干脆直接加, 但二者都会造成额外的请求
+        try:
+            _card_count = max(3, int(_job_count))
+        except (TypeError, ValueError):
+            _card_count = 3
+        seen_jobs = set()
+        for _possible_num in range(_card_count):
+            # 学习界面任务卡片数通常不多，但不同课程布局可能超过 0/1/2。
             _url = f"https://mooc1.chaoxing.com/mooc-ans/knowledge/cards?clazzid={_clazzid}&courseid={_courseid}&knowledgeid={_knowledgeid}&num={_possible_num}&ut=s&cpi={_cpi}&v=20160407-3&mooc2=1"
             logger.trace("开始读取章节所有任务点...")
-            _resp = _session.get(_url)
+            _resp = None
+            for _verify_retry in range(3):
+                _resp = _session.get(_url)
+                if not is_verify_page(_resp.text):
+                    break
+                wait_seconds = random.uniform(2, 5) * (_verify_retry + 1)
+                logger.warning(
+                    f"读取章节任务点时触发验证码风控(num={_possible_num})，"
+                    f"将在 {wait_seconds:.1f}s 后重试"
+                )
+                time.sleep(wait_seconds)
+            if _resp is None:
+                continue
+            if is_verify_page(_resp.text):
+                raise VerifyPageError(
+                    "超星返回验证码校验页(9010)，无法继续可靠读取章节任务。"
+                    "请稍后重试，或手动在网页端完成验证码后再运行。"
+                )
             _job_list, _job_info = decode_course_card(_resp.text)
             if _job_info.get("notOpen", False):
                 # 直接返回, 节省一次请求
                 logger.info("该章节未开放")
                 return [], _job_info
-            job_list += _job_list
+            for _job in _job_list:
+                _job_key = (_job.get("jobid"), _job.get("type"))
+                if _job_key in seen_jobs:
+                    continue
+                seen_jobs.add(_job_key)
+                job_list.append(_job)
             job_info.update(_job_info)
             # if _job_list and len(_job_list) != 0:
             #     break
@@ -230,6 +264,39 @@ class Chaoxing:
             logger.warning("出现403报错, 尝试修复无效...")
             return {"isPassed": False, "error": "403"}  # 添加403错误标记
 
+    def finalize_video_progress(
+        self,
+        _session,
+        _course,
+        _job,
+        _job_info,
+        _dtoken,
+        _duration,
+        _playingTime,
+        _type: str = "Video",
+    ):
+        candidate_times = []
+        start_time = max(_playingTime, int(_duration) - 3)
+        for candidate in range(start_time, int(_duration) + 1):
+            if candidate not in candidate_times:
+                candidate_times.append(candidate)
+
+        last_response = None
+        for candidate in candidate_times:
+            last_response = self.video_progress_log(
+                _session,
+                _course,
+                _job,
+                _job_info,
+                _dtoken,
+                _duration,
+                candidate,
+                _type,
+            )
+            if last_response and last_response.get("isPassed"):
+                return last_response
+        return last_response
+
     def study_video(
         self, _course, _job, _job_info, _speed: float = 1.0, _type: str = "Video"
     ):
@@ -289,7 +356,16 @@ class Chaoxing:
                 _wait_time = get_random_seconds()
                 if _playingTime + _wait_time >= int(_duration):
                     _wait_time = int(_duration) - _playingTime
-                    _iPassed = self.video_progress_log(_session, _course, _job, _job_info, _dtoken, _duration, _duration, _type)
+                    _iPassed = self.finalize_video_progress(
+                        _session,
+                        _course,
+                        _job,
+                        _job_info,
+                        _dtoken,
+                        _duration,
+                        _playingTime,
+                        _type,
+                    )
                     # 检查最终提交是否403
                     if _iPassed and _iPassed.get("error") == "403":
                         _403_retry_count += 1
@@ -547,22 +623,34 @@ class Chaoxing:
                 if q["type"] == "multiple":
                     # 多选处理
                     options_list = multi_cut(q["options"])
-                    for _a in clean_res(multi_cut(res)):
+                    raw_res_list = multi_cut(res)
+                    for i, _a in enumerate(raw_res_list):
+                        _a_clean = clean_res([_a])[0]
+                        # 特殊处理：clean_res 清理后变空但原始值是单个字母（A-Z），
+                        # 说明题库返回的是选项代码（如 "B"），直接使用
+                        if not _a_clean and i < len(raw_res_list):
+                            orig = raw_res_list[i]
+                            if orig and orig.upper() in 'ABCDEFGHIJKLMNOPQRSTUVWXYZ':
+                                answer += orig.upper()
+                                continue
+                        # 正常匹配流程
                         for o in options_list:
-                            if (
-                                _a in o
-                            ):
+                            if _a_clean and _a_clean in o:
                                 answer += o[:1]
                     # 对答案进行排序, 否则会提交失败
-                    answer = "".join(sorted(answer))
+                    answer = "".join(sorted(set(answer)))
                 elif q["type"] == "single":
                     # 单选也进行切割，主要是防止返回的答案有异常字符
                     options_list = multi_cut(q["options"])
+                    # 特殊处理：如果 clean_res 后结果为空，说明题库返回的是单个字母选项代码
                     t_res = clean_res(res)
-                    for o in options_list:
-                        if t_res[0] in o:
-                            answer = o[:1]
-                            break
+                    if not t_res[0] and len(res) == 1 and res.upper() in 'ABCDEFGHIJKLMNOPQRSTUVWXYZ':
+                        answer = res.upper()
+                    else:
+                        for o in options_list:
+                            if t_res[0] and t_res[0] in o:
+                                answer = o[:1]
+                                break
                 elif q["type"] == "judgement":
                     answer = "true" if self.tiku.jugement_select(res) else "false"
                 elif q["type"] == "completion":
@@ -601,7 +689,7 @@ class Chaoxing:
                 questions.update(
                     {
                         f'answer{q["id"]}':
-                            q["answerField"][f'answer{q["id"]}'] if q[f'answerSource{q["id"]}'] == "cover" else '',
+                            q["answerField"][f'answer{q["id"]}'],
                         f'answertype{q["id"]}': q["answerField"][f'answertype{q["id"]}'],
                     }
                 )
@@ -637,13 +725,56 @@ class Chaoxing:
             },
         )
         if res.status_code == 200:
-            res_json = res.json()
-            if res_json["status"]:
-                logger.info(f'提交答题成功 -> {res_json["msg"]}')
-            else:
-                logger.error(f'提交答题失败 -> {res_json["msg"]}')
+            # 检查是否是验证码拦截页面
+            if '9010' in res.text or 'processVerify.ac' in res.text:
+                logger.warning(f"提交触发验证码拦截(9010)，答案已填入但需人工验证")
+                logger.warning(f"请在 {max(3, 10 - self.rollback_times * 2)} 秒后手动在网页端完成验证并提交")
+                # 等待一段时间后重试提交
+                retry_wait = 10 - self.rollback_times * 2
+                if retry_wait > 0:
+                    logger.info(f"等待 {retry_wait} 秒后重试提交...")
+                    time.sleep(retry_wait)
+                    res = _session.post(
+                        "https://mooc1.chaoxing.com/mooc-ans/work/addStudentWorkNew",
+                        data=questions,
+                        headers={
+                            "Host": "mooc1.chaoxing.com",
+                            "sec-ch-ua-platform": '"Windows"',
+                            "X-Requested-With": "XMLHttpRequest",
+                            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/129.0.0.0 Safari/537.36 Edg/129.0.0.0",
+                            "Accept": "application/json, text/javascript, */*; q=0.01",
+                            "sec-ch-ua": '"Microsoft Edge";v="129", "Not=A?Brand";v="8", "Chromium";v="129"',
+                            "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
+                            "sec-ch-ua-mobile": "?0",
+                            "Origin": "https://mooc1.chaoxing.com",
+                            "Sec-Fetch-Site": "same-origin",
+                            "Sec-Fetch-Mode": "cors",
+                            "Sec-Fetch-Dest": "empty",
+                            "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8,en-GB;q=0.7,en-US;q=0.6,ja;q=0.5",
+                        },
+                    )
+                    if '9010' not in res.text and 'processVerify.ac' not in res.text:
+                        try:
+                            res_json = res.json()
+                            if res_json["status"]:
+                                logger.info(f'重试提交成功 -> {res_json["msg"]}')
+                            else:
+                                logger.error(f'重试提交失败 -> {res_json["msg"]}')
+                        except Exception:
+                            logger.error(f"重试提交后解析响应失败 -> {res.text[:200]}")
+                        return
+                logger.error(f"验证码未能自动通过，答案已填入。请手动完成验证后提交")
+                return
+            try:
+                res_json = res.json()
+                if res_json["status"]:
+                    logger.info(f'提交答题成功 -> {res_json["msg"]}')
+                else:
+                    logger.error(f'提交答题失败 -> {res_json["msg"]}')
+            except Exception as e:
+                logger.error(f"提交答题后解析响应失败 -> {e}")
         else:
-            logger.error(f"提交答题失败 -> {res.text}")
+            logger.error(f"提交答题失败 (HTTP {res.status_code}) -> {res.text[:200]}")
 
     def strdy_read(self, _course, _job, _job_info) -> None:
         """
