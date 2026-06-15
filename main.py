@@ -7,7 +7,14 @@ import re
 
 from api.logger import logger
 from api.base import Chaoxing, Account
-from api.exceptions import LoginError, FormatError, JSONDecodeError, MaxRollBackError, VideoProgress403Error
+from api.exceptions import (
+    FormatError,
+    JSONDecodeError,
+    LoginError,
+    MaxRollBackError,
+    VerifyPageError,
+    VideoProgress403Error,
+)
 from api.answer import Tiku
 from urllib3 import disable_warnings, exceptions
 import time
@@ -123,17 +130,24 @@ def chapter_matches(point, chapter_filters, point_index=None):
     point_title = str(point.get("title", "")).strip()
     point_title_lower = point_title.lower()
     outline_number = extract_title_outline_number(point_title)
+    chapter_number = None
+    if outline_number:
+        try:
+            chapter_number = int(outline_number.split(".")[0])
+        except ValueError:
+            chapter_number = None
     for chapter_filter in chapter_filters:
         chapter_filter = str(chapter_filter).strip()
         if not chapter_filter:
             continue
         range_match = re.fullmatch(r"(\d+)\s*-\s*(\d+)", chapter_filter)
-        if range_match and point_index is not None:
+        if range_match:
             start = int(range_match.group(1))
             end = int(range_match.group(2))
             if start > end:
                 start, end = end, start
-            if start <= point_index <= end:
+            target_number = chapter_number if chapter_number is not None else point_index
+            if target_number is not None and start <= target_number <= end:
                 return True
             continue
         if re.fullmatch(r"\d+(?:\.\d+)+", chapter_filter):
@@ -141,9 +155,8 @@ def chapter_matches(point, chapter_filters, point_index=None):
                 return True
             continue
         if chapter_filter.isdigit():
-            if point_index is not None and int(chapter_filter) == point_index:
-                return True
-            if outline_number == chapter_filter:
+            target_number = chapter_number if chapter_number is not None else point_index
+            if target_number is not None and int(chapter_filter) == target_number:
                 return True
             continue
         if point_id == chapter_filter:
@@ -184,6 +197,10 @@ def init_config():
         action="store_true",
         help="启用调试模式, 输出DEBUG级别日志",
     )
+    parser.add_argument(
+        "-w", "--skip-work", type=str, default=None,
+        help="任务模式: 0=正常(视频+答题), 1=只刷视频(跳过答题), 2=只答题(跳过视频)",
+    )
 
     # 在解析之前捕获 -h 的行为
     if len(sys.argv) == 2 and sys.argv[1] in {"-h", "--help"}:
@@ -214,7 +231,11 @@ def init_config():
             # 处理speed，将字符串转换为浮点数
             if "speed" in common_config:
                 common_config["speed"] = float(common_config["speed"])
-        
+            # 命令行 -w 参数覆盖配置文件
+            if args.skip_work is not None:
+                common_config["skip_work"] = args.skip_work
+                logger.info(f"命令行覆盖 skip_work = {args.skip_work}")
+
         # 检查并读取tiku节
         if config.has_section("tiku"):
             tiku_config = dict(config.items("tiku"))
@@ -264,7 +285,10 @@ if __name__ == "__main__":
         course_list = common_config.get("course_list",None)
         chapter_list = common_config.get("chapter_list",None)
         speed = common_config.get("speed",1)
-        skip_work = common_config.get("skip_work", "false").lower() == "true"  # 读取是否跳过答题配置
+        skip_work_str = str(common_config.get("skip_work", "0")).strip()
+        # 0=正常(视频+答题), 1=只刷视频(跳过答题), 2=只答题(跳过视频)
+        skip_work = skip_work_str.lower() in {"true", "1"}
+        skip_video = skip_work_str == "2"
         query_delay = tiku_config.get("delay",0)
         # 规范化播放速度的输入值
         speed = min(2.0, max(1.0, speed))
@@ -288,6 +312,8 @@ if __name__ == "__main__":
         # 显示配置信息
         if skip_work:
             logger.info("已开启【只刷视频】模式，将跳过所有答题任务")
+        elif skip_video:
+            logger.info("已开启【只答题】模式，将跳过所有视频任务")
 
         # 获取所有的课程列表
         all_course = chaoxing.get_course_list()
@@ -316,6 +342,10 @@ if __name__ == "__main__":
             logger.info(f"已启用章节筛选: {chapter_list}")
         checkpoint = load_checkpoint()
         resume_mode = checkpoint is not None
+        matched_point_count = 0
+        executed_job_count = 0
+        empty_job_point_count = 0
+        skipped_work_only_count = 0
         if checkpoint:
             logger.warning(
                 f"检测到断点续跑: 课程[{checkpoint['courseTitle']}] "
@@ -341,16 +371,21 @@ if __name__ == "__main__":
                 if not resume_mode and not chapter_matches(point, chapter_list, chapter_number):
                     __point_index += 1
                     continue
-                logger.info(f'当前章节: 第{chapter_number}章 {point["title"]}')
+                matched_point_count += 1
+                logger.info(f'当前章节: {point["title"]} (列表序号: {chapter_number})')
                 logger.debug(f"当前章节 __point_index: {__point_index}")  # 触发参数: -v
-                sleep_duration = random.uniform(1, 3)
+                sleep_duration = 10
                 logger.debug(f"本次随机等待时间: {sleep_duration}")
-                time.sleep(sleep_duration)  # 避免请求过快导致异常, 所以引入随机sleep
+                time.sleep(sleep_duration)  # 避免请求过快导致异常
                 # 获取当前章节的所有任务点
                 jobs = []
                 job_info = None
                 jobs, job_info = chaoxing.get_job_list(
-                    course["clazzId"], course["courseId"], course["cpi"], point["id"]
+                    course["clazzId"],
+                    course["courseId"],
+                    course["cpi"],
+                    point["id"],
+                    point.get("jobCount", 3),
                 )
 
                 # bookID = job_info["knowledgeid"] # 获取视频ID
@@ -381,6 +416,12 @@ if __name__ == "__main__":
                             "断点任务恢复时当前章节任务列表为空，不判定为已完成，"
                             "将取消断点并继续从后续章节重新检查"
                         )
+                    empty_job_point_count += 1
+                    logger.warning(
+                        f"当前章节未发现可执行任务: {point['title']}。"
+                        "这通常表示接口返回该章节没有待完成的视频/文档/阅读/章节检测任务，"
+                        "不等同于学习通页面一定显示100%完成。"
+                    )
                     __point_index += 1
                     continue
                 if resume_mode:
@@ -392,6 +433,7 @@ if __name__ == "__main__":
                     else:
                         logger.info(f"从断点任务继续: {checkpoint['jobName']}")
                 # 遍历所有任务点
+                handled_job_count = 0
                 for job in jobs:
                     if resume_mode and job["jobid"] != checkpoint["jobid"]:
                         continue
@@ -410,31 +452,39 @@ if __name__ == "__main__":
                         logger.trace(
                             f"识别到视频任务, 任务章节: {course['title']} 任务ID: {job['jobid']}"
                         )
+                        handled_job_count += 1
+                        executed_job_count += 1
                         save_checkpoint(course, point, job)
-                        # 超星的接口没有返回当前任务是否为Audio音频任务
-                        isAudio = False
-                        try:
-                            chaoxing.study_video(
-                                course, job, job_info, _speed=speed, _type="Video"
-                            )
-                        except JSONDecodeError as e:
-                            logger.warning("当前任务非视频任务, 正在尝试音频任务解码")
-                            isAudio = True
-                        if isAudio:
+                        if skip_video:
+                            logger.info(f"【只答题模式】跳过视频任务: {course['title']} - {job.get('title', job['jobid'])}")
+                            clear_checkpoint()
+                        else:
+                            # 超星的接口没有返回当前任务是否为Audio音频任务
+                            isAudio = False
                             try:
                                 chaoxing.study_video(
-                                    course, job, job_info, _speed=speed, _type="Audio"
+                                    course, job, job_info, _speed=speed, _type="Video"
                                 )
                             except JSONDecodeError as e:
-                                logger.warning(
-                                    f"出现异常任务 -> 任务章节: {course['title']} 任务ID: {job['jobid']}, 已跳过"
-                                )
-                        clear_checkpoint()
+                                logger.warning("当前任务非视频任务, 正在尝试音频任务解码")
+                                isAudio = True
+                            if isAudio:
+                                try:
+                                    chaoxing.study_video(
+                                        course, job, job_info, _speed=speed, _type="Audio"
+                                    )
+                                except JSONDecodeError as e:
+                                    logger.warning(
+                                        f"出现异常任务 -> 任务章节: {course['title']} 任务ID: {job['jobid']}, 已跳过"
+                                    )
+                            clear_checkpoint()
                     # 文档任务
                     elif job["type"] == "document":
-                        logger.trace(
-                            f"识别到文档任务, 任务章节: {course['title']} 任务ID: {job['jobid']}"
-                        )
+                        if skip_video:
+                            logger.info(f"【只答题模式】跳过文档任务: {course['title']} - {job.get('title', job['jobid'])}")
+                            continue
+                        handled_job_count += 1
+                        executed_job_count += 1
                         save_checkpoint(course, point, job)
                         chaoxing.study_document(course, job)
                         clear_checkpoint()
@@ -443,18 +493,37 @@ if __name__ == "__main__":
                         if skip_work:
                             logger.info(f"【只刷视频模式】跳过章节检测任务: {course['title']}")
                             continue
+                        handled_job_count += 1
+                        executed_job_count += 1
                         logger.trace(f"识别到章节检测任务, 任务章节: {course['title']}")
                         save_checkpoint(course, point, job)
                         chaoxing.study_work(course, job, job_info)
                         clear_checkpoint()
                     # 阅读任务
                     elif job["type"] == "read":
+                        if skip_video:
+                            logger.info(f"【只答题模式】跳过阅读任务: {course['title']} - {job.get('title', job['jobid'])}")
+                            continue
                         logger.trace(f"识别到阅读任务, 任务章节: {course['title']}")
+                        handled_job_count += 1
+                        executed_job_count += 1
                         save_checkpoint(course, point, job)
                         chaoxing.strdy_read(course, job, job_info)
                         clear_checkpoint()
+                if handled_job_count == 0:
+                    skipped_work_only_count += 1
+                    logger.warning(
+                        f"当前章节存在待完成任务，但都被当前模式跳过了: {point['title']}。"
+                        "如果学习通页面仍显示未完成，请检查 skip_work 设置。"
+                    )
                 __point_index += 1
-        logger.info("所有课程学习任务已完成")
+        logger.info(
+            "本次扫描结束: "
+            f"命中章节 {matched_point_count} 个, "
+            f"实际执行任务 {executed_job_count} 个, "
+            f"无可执行任务章节 {empty_job_point_count} 个, "
+            f"被当前模式全部跳过的章节 {skipped_work_only_count} 个"
+        )
         clear_checkpoint()
 
     except SystemExit as e:
@@ -464,6 +533,13 @@ if __name__ == "__main__":
             raise
     except VideoProgress403Error:
         restart_current_command()
+    except VerifyPageError as e:
+        logger.error(str(e))
+        sys.exit(1)
+    except KeyboardInterrupt:
+        print()
+        logger.warning("检测到 Ctrl+C，中断当前运行并退出。断点已保留，可下次继续。")
+        sys.exit(130)
     except BaseException as e:
         import traceback
 
