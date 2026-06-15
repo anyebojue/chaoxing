@@ -6,6 +6,46 @@ from api.logger import logger
 from api.font_decoder import FontDecoder
 
 
+def extract_js_object_assignment(_text: str, var_name: str):
+    pattern = re.compile(rf"{re.escape(var_name)}\s*=")
+    for match in pattern.finditer(_text):
+        idx = match.end()
+        while idx < len(_text) and _text[idx].isspace():
+            idx += 1
+        if idx >= len(_text) or _text[idx] != "{":
+            continue
+
+        start = idx
+        depth = 0
+        in_string = False
+        escape = False
+        quote_char = ""
+
+        for pos in range(start, len(_text)):
+            ch = _text[pos]
+            if in_string:
+                if escape:
+                    escape = False
+                elif ch == "\\":
+                    escape = True
+                elif ch == quote_char:
+                    in_string = False
+                continue
+
+            if ch in ('"', "'"):
+                in_string = True
+                quote_char = ch
+                continue
+            if ch == "{":
+                depth += 1
+                continue
+            if ch == "}":
+                depth -= 1
+                if depth == 0:
+                    return _text[start : pos + 1]
+    return None
+
+
 def decode_course_list(_text):
     logger.trace("开始解码课程列表...")
     _soup = BeautifulSoup(_text, "lxml")
@@ -102,12 +142,11 @@ def decode_course_card(_text: str):
         _job_info["notOpen"] = True
         return [], _job_info
 
-    _temp = re.findall(r"mArg=\{(.*?)\};", _text.replace(" ", ""))
-    if _temp:
-        _temp = _temp[0]
-    else:
+    _temp = extract_js_object_assignment(_text, "mArg")
+    if not _temp:
+        logger.warning("任务卡片页面未匹配到 mArg，当前章节任务可能解析失败")
         return [], {}
-    _cards = json.loads("{" + _temp + "}")
+    _cards = json.loads(_temp)
 
     if _cards:
         _job_info = {}
